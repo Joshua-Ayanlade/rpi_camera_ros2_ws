@@ -1,0 +1,13 @@
+# colcon build output
+/build/
+/install/
+/log/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
