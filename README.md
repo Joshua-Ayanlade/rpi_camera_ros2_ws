@@ -77,7 +77,7 @@ You should see your camera listed. If you get "command not found", the tools are
 ## 3. Clone and build
 
 ```bash
-git clone --recurse-submodules https://github.com/<your-username>/rpi_camera_ros2_ws.git ~/camera_ws
+git clone --recurse-submodules https://github.com/Joshua-Ayanlade/rpi_camera_ros2_ws.git ~/camera_ws
 cd ~/camera_ws
 ```
 
