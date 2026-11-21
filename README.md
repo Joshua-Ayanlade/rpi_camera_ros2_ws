@@ -13,7 +13,7 @@ The ROS-packaged `libcamera` often doesn't work with Raspberry Pi cameras. The u
 | Item | Value |
 |------|-------|
 | Board | Raspberry Pi 4 (4 GB) |
-| Camera | Camera Module 3 |
+| Camera | Camera Module 1 |
 | OS | Ubuntu 24.04 |
 | ROS 2 | Jazzy |
 
