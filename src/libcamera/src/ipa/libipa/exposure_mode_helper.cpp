@@ -1,0 +1,298 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * Copyright (C) 2024, Paul Elder <paul.elder@ideasonboard.com>
+ *
+ * Helper class that performs computations relating to exposure
+ */
+#include "exposure_mode_helper.h"
+
+#include <algorithm>
+
+#include <libcamera/base/log.h>
+
+/**
+ * \file exposure_mode_helper.h
+ * \brief Helper class that performs computations relating to exposure
+ *
+ * AEGC algorithms have a need to split exposure between exposure time, analogue
+ * and digital gain. Multiple implementations do so based on paired stages of
+ * exposure time and gain limits; provide a helper to avoid duplicating the code.
+ */
+
+namespace libcamera {
+
+using namespace std::literals::chrono_literals;
+
+LOG_DEFINE_CATEGORY(ExposureModeHelper)
+
+namespace ipa {
+
+/**
+ * \class ExposureModeHelper
+ * \brief Class for splitting exposure into exposure time and total gain
+ *
+ * The ExposureModeHelper class provides a standard interface through which an
+ * AEGC algorithm can divide exposure between exposure time and gain. It is
+ * configured with a set of exposure time and gain pairs and works by initially
+ * fixing gain at 1.0 and increasing exposure time up to the exposure time value
+ * from the first pair in the set in an attempt to meet the required exposure
+ * value.
+ *
+ * If the required exposure is not achievable by the first exposure time value
+ * alone it ramps gain up to the value from the first pair in the set. If the
+ * required exposure is still not met it then allows exposure time to ramp up to
+ * the exposure time value from the second pair in the set, and continues in this
+ * vein until either the required exposure time is met, or else the hardware's
+ * exposure time or gain limits are reached.
+ *
+ * This method allows users to strike a balance between a well-exposed image and
+ * an acceptable frame-rate, as opposed to simply maximising exposure time
+ * followed by gain. The same helpers can be used to perform the latter
+ * operation if needed by passing an empty set of pairs to the initialisation
+ * function.
+ *
+ * The gain values may exceed a camera sensor's analogue gain limits if either
+ * it or the IPA is also capable of digital gain. The configure() function must
+ * be called with the hardware's limits to inform the helper of those
+ * constraints. Any gain that is needed will be applied as analogue gain first
+ * until the hardware's limit is reached, following which digital gain will be
+ * used.
+ */
+
+/**
+  * \class ExposureModeHelper::Stage
+  * \brief Details of an exposure stage
+  *
+  * This type contains the parameters of a single exposure stage as used by the
+  * algorithm.
+  *
+  * \var ExposureModeHelper::Stage::exposureTime
+  * \brief The maximum exposure time of the stage
+  *
+  * \var ExposureModeHelper::Stage::gain
+  * \brief The maximum analogue gain of the stage
+  */
+
+/**
+ * \brief Construct an ExposureModeHelper instance
+ * \param[in] stages The vector of paired exposure time and gain limits
+ *
+ * The vector of stages may be empty. In that case, the helper will simply use
+ * the runtime limits set through setLimits() instead.
+ */
+ExposureModeHelper::ExposureModeHelper(std::vector<Stage> &&stages)
+	: stages_(std::move(stages)), lineDuration_(1us), minExposureTime_(0us),
+	  maxExposureTime_(0us), minGain_(0), maxGain_(0), sensorHelper_(nullptr)
+{
+	ASSERT(!stages_.empty());
+}
+
+/**
+ * \brief Configure sensor details
+ * \param[in] lineDuration The current line length of the sensor
+ * \param[in] sensorHelper The sensor helper
+ *
+ * This function sets the line length and sensor helper. These are used in
+ * splitExposure() to take the quantization of the exposure and gain into
+ * account.
+ *
+ * When this has not been called, it is assumed that exposure is in micro second
+ * granularity and gain has no quantization at all.
+ *
+ * ExposureModeHelper keeps a pointer to the CameraSensorHelper, so the caller
+ * has to ensure that sensorHelper is valid until the next call to configure().
+ */
+void ExposureModeHelper::configure(utils::Duration lineDuration,
+				   const CameraSensorHelper *sensorHelper)
+{
+	lineDuration_ = lineDuration;
+	sensorHelper_ = sensorHelper;
+}
+
+/**
+ * \brief Set the exposure time and gain limits
+ * \param[in] minExposureTime The minimum exposure time supported
+ * \param[in] maxExposureTime The maximum exposure time supported
+ * \param[in] minGain The minimum analogue gain supported
+ * \param[in] maxGain The maximum analogue gain supported
+ *
+ * This function configures the exposure time and analogue gain limits that need
+ * to be adhered to as the helper divides up exposure. Note that this function
+ * *must* be called whenever those limits change and before splitExposure() is
+ * used.
+ *
+ * If the algorithm using the helpers needs to indicate that either exposure time
+ * or analogue gain or both should be fixed it can do so by setting both the
+ * minima and maxima to the same value.
+ */
+void ExposureModeHelper::setLimits(utils::Duration minExposureTime,
+				   utils::Duration maxExposureTime,
+				   double minGain, double maxGain)
+{
+	minExposureTime_ = minExposureTime;
+	maxExposureTime_ = maxExposureTime;
+	minGain_ = minGain;
+	maxGain_ = maxGain;
+}
+
+utils::Duration ExposureModeHelper::clampExposureTime(utils::Duration exposureTime,
+						      double *quantizationGain) const
+{
+	utils::Duration clamped;
+	utils::Duration exp;
+
+	clamped = std::clamp(exposureTime, minExposureTime_, maxExposureTime_);
+	exp = static_cast<long>(clamped / lineDuration_) * lineDuration_;
+	if (quantizationGain)
+		*quantizationGain = clamped / exp;
+
+	return exp;
+}
+
+double ExposureModeHelper::clampGain(double gain, double *quantizationGain) const
+{
+	double clamped = std::clamp(gain, minGain_, maxGain_);
+	if (sensorHelper_)
+		return sensorHelper_->quantizeGain(clamped, quantizationGain);
+
+	if (quantizationGain)
+		*quantizationGain = 1.0;
+
+	return clamped;
+}
+
+/**
+ * \struct ExposureModeHelper::Result
+ * \brief Result of splitExposure()
+ *
+ * \var ExposureModeHelper::Result::exposureTime
+ * \brief The applicable exposure time
+ *
+ * \var ExposureModeHelper::Result::analogueGain
+ * \brief The applicable analogue gain
+ *
+ * \var ExposureModeHelper::Result::quantizationGain
+ * \brief The applicable quantization gain
+ *
+ * \var ExposureModeHelper::Result::digitalGain
+ * \brief The applicable digital gain
+ */
+
+/**
+ * \brief Split exposure into exposure time and gain
+ * \param[in] exposure Exposure value
+ *
+ * This function divides a given exposure into exposure time, analogue and
+ * digital gain by iterating through stages of exposure time and gain limits.
+ * At each stage the current stage's exposure time limit is multiplied by the
+ * previous stage's gain limit (or 1.0 initially) to see if the combination of
+ * the two can meet the required exposure. If they cannot then the current
+ * stage's exposure time limit is multiplied by the same stage's gain limit to
+ * see if that combination can meet the required exposure time. If they cannot
+ * then the function moves to consider the next stage.
+ *
+ * When a combination of exposure time and gain _stage_ limits are found that
+ * are sufficient to meet the required exposure, the function attempts to reduce
+ * exposure time as much as possible whilst fixing gain and still meeting the
+ * exposure. If a _runtime_ limit prevents exposure time from being lowered
+ * enough to meet the exposure with gain fixed at the stage limit, gain is also
+ * lowered to compensate.
+ *
+ * Once the exposure time and gain values are ascertained, gain is assigned as
+ * analogue gain as much as possible, with digital gain only in use if the
+ * maximum analogue gain runtime limit is unable to accommodate the exposure
+ * value.
+ *
+ * If no combination of exposure time and gain limits is found that meets the
+ * required exposure, then the exposure and gain of the last stage will be used,
+ * and the digital gain will be increased as necessary.
+ *
+ * During the calculations the gain missed due to quantization is recorded and
+ * returned as quantization gain. The quantization gain is not included in the
+ * digital gain. So to exactly apply the given exposure, both quantization gain
+ * and digital gain must be applied.
+ *
+ * \return Tuple of exposure time, analogue gain, quantization gain and digital
+ * gain
+ */
+ExposureModeHelper::Result
+ExposureModeHelper::splitExposure(utils::Duration exposure) const
+{
+	ASSERT(maxExposureTime_);
+	ASSERT(maxGain_);
+	ASSERT(!stages_.empty());
+
+	utils::Duration exposureTime;
+	double gain;
+	double quantGain;
+	double quantGain2;
+	bool gainFixed = minGain_ == maxGain_;
+	bool exposureTimeFixed = minExposureTime_ == maxExposureTime_;
+
+	/*
+	 * There's no point entering the loop if we cannot change either gain
+	 * nor exposure time anyway.
+	 */
+	if (exposureTimeFixed && gainFixed) {
+		exposureTime = clampExposureTime(minExposureTime_, &quantGain);
+		gain = clampGain(minGain_, &quantGain2);
+		quantGain *= quantGain2;
+
+		return { exposureTime, gain, quantGain,
+			 exposure / (exposureTime * gain * quantGain) };
+	}
+
+	utils::Duration stageExposureTime = {};
+	double lastStageGain = clampGain(1.0);
+	double stageGain = {};
+
+	for (const auto &stage : stages_) {
+		stageExposureTime = clampExposureTime(stage.exposureTime, &quantGain);
+		stageGain = clampGain(stage.gain, &quantGain2);
+
+		/*
+		 * We perform the clamping on both exposure time and gain in
+		 * case the helper has had limits set that prevent those values
+		 * being lowered beyond a certain minimum...this can happen at
+		 * runtime for various reasons and so would not be known when
+		 * the stage limits are initialised.
+		 */
+
+		/* Clamp the gain to lastStageGain and regulate exposureTime. */
+		if (stageExposureTime * lastStageGain >= exposure) {
+			exposureTime = clampExposureTime(exposure / lastStageGain, &quantGain);
+			gain = clampGain(exposure / exposureTime, &quantGain2);
+			quantGain *= quantGain2;
+
+			return { exposureTime, gain, quantGain,
+				 exposure / (exposureTime * gain * quantGain) };
+		}
+
+		/* Clamp the exposureTime to stageExposureTime and regulate gain. */
+		if (stageExposureTime * stageGain >= exposure) {
+			exposureTime = stageExposureTime;
+			gain = clampGain(exposure / exposureTime, &quantGain2);
+			quantGain *= quantGain2;
+
+			return { exposureTime, gain, quantGain,
+				 exposure / (exposureTime * gain * quantGain) };
+		}
+
+		lastStageGain = stageGain;
+	}
+
+	/*
+	 * If no stages could satisfy the desired exposure, then use the last
+	 * stage's exposure time and gain, which is the maximum allowed.
+	 */
+	exposureTime = stageExposureTime;
+	gain = stageGain;
+	quantGain *= quantGain2;
+
+	return { exposureTime, gain, quantGain,
+		 exposure / (exposureTime * gain * quantGain) };
+}
+
+} /* namespace ipa */
+
+} /* namespace libcamera */

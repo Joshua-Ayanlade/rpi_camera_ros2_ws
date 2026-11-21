@@ -1,0 +1,60 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * Copyright (C) 2024, Paul Elder <paul.elder@ideasonboard.com>
+ *
+ * Helper class that performs computations relating to exposure
+ */
+
+#pragma once
+
+#include <vector>
+
+#include <libcamera/base/utils.h>
+
+#include "camera_sensor_helper.h"
+
+namespace libcamera {
+
+namespace ipa {
+
+class ExposureModeHelper
+{
+public:
+	struct Stage {
+		utils::Duration exposureTime;
+		double gain;
+	};
+
+	ExposureModeHelper(std::vector<Stage> &&stages);
+
+	void configure(utils::Duration lineLength, const CameraSensorHelper *sensorHelper);
+	void setLimits(utils::Duration minExposureTime, utils::Duration maxExposureTime,
+		       double minGain, double maxGain);
+
+	struct Result {
+		utils::Duration exposureTime;
+		double analogueGain;
+		double quantizationGain;
+		double digitalGain;
+	};
+
+	[[nodiscard]] Result splitExposure(utils::Duration exposure) const;
+
+private:
+	utils::Duration clampExposureTime(utils::Duration exposureTime,
+					  double *quantizationGain = nullptr) const;
+	double clampGain(double gain, double *quantizationGain = nullptr) const;
+
+	std::vector<Stage> stages_;
+
+	utils::Duration lineDuration_;
+	utils::Duration minExposureTime_;
+	utils::Duration maxExposureTime_;
+	double minGain_;
+	double maxGain_;
+	const CameraSensorHelper *sensorHelper_;
+};
+
+} /* namespace ipa */
+
+} /* namespace libcamera */
